@@ -80,6 +80,132 @@
 */
 
 #include "utils.h"
+#include <cstdio>
+
+__global__ void reduce_kernel(float* d_out, const float* const d_in, const int arraySize, bool isMax) {
+    extern __shared__ float sdata[];
+    const int myId = blockIdx.x*blockDim.x + threadIdx.x;
+    const int tid = threadIdx.x;
+    
+    //if(myId >= arraySize)
+    //    return;
+    
+	if(myId < arraySize)
+		sdata[tid] = d_in[myId];
+    __syncthreads();
+    int maxId = 0;
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && myId + s < arraySize) {
+			float val1 = sdata[tid];
+			float val2 = sdata[tid+s];
+			sdata[tid] = isMax ? (val1 > val2 ? val1 : val2) : (val1 < val2 ? val1 : val2);
+			maxId = isMax ? (val1 > val2 ? myId : myId+s) : (val1 < val2 ? myId : myId+s);
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0)
+        d_out[blockIdx.x] = sdata[0];
+}
+
+
+__global__ void histo_kernel(unsigned int* d_histogram, 
+                             const float* const d_lum, 
+                             const float lumMin, 
+                             const float lumRange, 
+                             const size_t numBins,
+                             const size_t arraySize)
+{
+    const int myId = blockIdx.x * blockDim.x + threadIdx.x;
+    if (myId >= arraySize)
+        return;
+    unsigned int bin = min(static_cast<unsigned int>(numBins - 1),
+                           static_cast<unsigned int>((d_lum[myId] - lumMin) / lumRange * static_cast<float>(numBins))); // for rounding error
+    atomicAdd(&d_histogram[bin], 1);
+}
+
+//__global__ void blelloch_scan_reduce_kernel (unsigned int* const d_out, 
+//                                             unsigned int* d_in,
+//                                             const size_t numBins)
+//{
+//    extern __shared__ unsigned int reduce_data[];
+//    const int numThreads = gridDim.x*blockDim.x;
+//    const int chunkSize = ceil((float)numBins / (float)numThreads);
+//    const int myId = (blockIdx.x * blockDim.x + threadIdx.x + 1) * chunkSize -1;
+//    if (myId >= numBins)
+//        return;
+//    // Copy data to shared memory
+//    const int tid = threadIdx.x;
+//    reduce_data[tid] = d_in[myId];
+//    __syncthreads();
+//    
+//    
+//    for (int offset = 1; offset < blockDim.x; offset <<= 1) {
+//        if(tid - offset >= 0 && (tid+1)%(2*offset) == 0) {
+//            reduce_data[tid] += reduce_data[tid-offset];
+//        }
+//        __syncthreads();
+//    }
+//    d_out[myId] = reduce_data[tid];
+//}
+//
+//__global__ void blelloch_scan_down_sweep (unsigned int* d_in_out,
+//                                          const size_t numBins)
+//{
+//    extern __shared__ unsigned int sweep_data[];
+//    const int numThreads = gridDim.x*blockDim.x;
+//    const int chunkSize = ceil((float)numBins / (float)numThreads);
+//    const int myId = (blockIdx.x * blockDim.x + threadIdx.x + 1) * chunkSize -1;
+//    if (myId >= numBins)
+//        return;
+//    // Copy data to shared memory
+//    const int tid = threadIdx.x;
+//    if(myId == numBins -1)
+//        sweep_data[tid] = 0;
+//    else
+//        sweep_data[tid] = d_in_out[myId];
+//    __syncthreads();
+//    
+//    
+//    for (int offset = blockDim.x >> 1; offset >=1; offset >>= 1) {
+//        if(tid - offset >= 0 && (blockDim.x-1-tid)%(offset << 1) == 0) {
+//            int tmp = sweep_data[tid];
+//            sweep_data[tid] += sweep_data[tid-offset];
+//            sweep_data[tid-offset] = tmp;
+//        }
+//        __syncthreads();
+//    }
+//    d_in_out[myId] = sweep_data[tid];
+//}
+
+__global__ void hillis_steele_scan (unsigned int* const d_out, 
+                                    unsigned int* d_in,
+                                    const size_t numBins)
+{
+	extern __shared__ int scan_data[];
+	const int myId = blockIdx.x * blockDim.x + threadIdx.x;
+	if(myId >= numBins)
+		return;
+	const int tid = threadIdx.x;
+	scan_data[tid] = d_in[myId];
+	__syncthreads();
+
+	for (unsigned int step = 1; step < numBins; step <<= 1) {
+		if (tid >= step) {
+			scan_data[tid] += scan_data[tid-step];
+		}
+		__syncthreads();
+	}
+	if (myId == 0)
+		d_out[myId] = 0;
+	else if(myId < numBins)
+    {
+        d_out[myId] = scan_data[tid-1];
+    }
+
+}
+
+
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   unsigned int* const d_cdf,
@@ -99,6 +225,82 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
     4) Perform an exclusive scan (prefix sum) on the histogram to get
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
+    float* d_tmp;
+    float* d_out;
+    unsigned int* d_histogram;
+    
+    const size_t arraySize = numRows * numCols;
+    const size_t arrayBytes = arraySize * sizeof(float);
+    size_t numThreads = 512;
+    size_t numBlocks = ceil(((float)arraySize) / ((float)numThreads));
+    printf("Array size: %d\n", arraySize);
+	printf("block number: %d\n", numBlocks);
+    // Allocate memory
+    checkCudaErrors(cudaMalloc(&d_tmp, sizeof(float) * numBlocks));
+    checkCudaErrors(cudaMalloc(&d_out, sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_histogram, sizeof(unsigned int)*numBins));
+    checkCudaErrors(cudaMemset(d_histogram, 0, sizeof(unsigned int)*numBins));
+    
+    reduce_kernel<<<numBlocks, numThreads, numThreads * sizeof(float)>>>
+        (d_tmp, d_logLuminance, arraySize, false);
+    
+	int threads = 1;
+	while (threads < numBlocks)
+		threads <<= 1;
+    reduce_kernel<<<1, threads, threads * sizeof(float)>>>  // # of threads must be power of 2!
+        (d_out, d_tmp, numBlocks, false);
+    
+    checkCudaErrors(cudaMemcpy(&min_logLum, d_out, sizeof(float), cudaMemcpyDeviceToHost));
+    
+    reduce_kernel<<<numBlocks, numThreads, numThreads * sizeof(float)>>>
+        (d_tmp, d_logLuminance, arraySize, true);
+    
+    reduce_kernel<<<1, threads, threads * sizeof(float)>>> // # of threads must be power of 2!
+        (d_out, d_tmp, numBlocks, true);
+	
+    checkCudaErrors(cudaMemcpy(&max_logLum, d_out, sizeof(float), cudaMemcpyDeviceToHost));
+    
+    printf("min: %f\n", min_logLum);
+    printf("max: %f\n", max_logLum);
+	
+	cudaFree(d_tmp);
+    cudaFree(d_out);
 
+    float lumRange = max_logLum - min_logLum;
+	printf("Bins: %d, lumRang: %f\n", numBins, lumRange);
+    numBlocks = ceil(((float)arraySize) / ((float)numThreads));
+    histo_kernel<<<numBlocks, numThreads>>>
+                                (d_histogram, 
+                                 d_logLuminance, 
+                                 min_logLum, 
+                                 lumRange, 
+                                 numBins,
+                                 arraySize);
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+    //// scan reduce
+    //numBlocks = ceil( (float)numBins / (float)numThreads );
+    //blelloch_scan_reduce_kernel<<<numBlocks, numThreads, numThreads*sizeof(int)>>>
+    //    ( d_cdf,
+    //      d_histogram,
+    //      numBins );
+    //
+    //blelloch_scan_reduce_kernel<<<1, numBlocks, numBlocks*sizeof(int)>>>
+    //    (d_cdf,
+    //     d_cdf,
+    //     numBins );
+    //
+    //// scan down sweep
+    //blelloch_scan_down_sweep<<<1, numBlocks, numBlocks*sizeof(int)>>>
+    //    (d_cdf,
+    //     numBins);
+    //blelloch_scan_down_sweep<<<numBlocks, numThreads, numThreads*sizeof(int)>>>
+    //    (d_cdf,
+    //     numBins);
 
+	hillis_steele_scan<<<1, numBins, numBins*sizeof(unsigned int)>>>(d_cdf, d_histogram, numBins);
+
+	cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+
+	cudaFree(d_histogram);
 }
+
